@@ -16,12 +16,19 @@ st.title("📱 TUG — Markov (baselines adaptativos + LL + R-grid) + Eventos G1
 
 st.markdown(
     """
-**Etapas:**
-- Preprocessamento: detrend → interpolação p/ 100 Hz → low-pass 15 Hz → norma
-- Discretização: k-means 1D (K estados) e relabel do estado 0 (repouso inicial)
-- Start/End: Markov + log-verossimilhança (LL) com loop em R (persistência)
-- Eventos: busca de **dois picos** entre **(start + offset)** e **end**: **G1 (primeiro)** e **G2 (último)**  
-  e delimitação do componente de cada pico via **sequência curta de retorno ao estado escolhido** (padrão = estado 1)
+**Ideia central (robusta):**
+- Discretiza a **norma** (k-means 1D)
+- Cria **dois mapas de estados**:
+  - `states_start`: baseline inicial vira **estado 0** (repouso inicial)
+  - `states_end`: baseline final vira **estado 0** (repouso final)
+- Calcula LL (log-verossimilhança deslizante) vs. Markov do repouso
+- Start = queda sustentada da LL (vs repouso inicial)
+- End = retorno sustentado da LL (vs repouso final) + filtros opcionais (movimento forte + quietness)
+
+**Eventos G1/G2:**
+- Busca de picos entre (start + offset) e end
+- G1 = primeiro pico; G2 = último pico
+- Componentes delimitados por retorno a um estado (padrão = estado 1)
 """
 )
 
@@ -68,10 +75,19 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Eventos G1/G2 (picos)")
-    # ✅ mudança solicitada: offset fixo de 2 s (deixo parametrizável)
-    peak_search_offset_s = st.number_input("Offset início p/ buscar picos (s)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
+    st.subheader("Correções do Fim (recomendadas)")
+    use_strong_move_gate = st.checkbox("Exigir movimento forte antes do fim (estado ≥ 2)", value=True)
+    strong_state_min = st.number_input("Estado mínimo p/ 'movimento forte'", min_value=1, max_value=50, value=2, step=1)
+    strong_lookback_s = st.number_input("Lookback antes do fim (s)", min_value=0.2, max_value=5.0, value=2.0, step=0.2)
+    strong_run_s = st.number_input("Run mínimo (s) com estado ≥ mínimo", min_value=0.02, max_value=1.0, value=0.10, step=0.02)
 
+    use_quiet_gate = st.checkbox("Quietness gate pós-fim (variância ~ baseline final)", value=True)
+    quiet_win_s = st.number_input("Janela pós-fim p/ variância (s)", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+    quiet_factor = st.number_input("Fator máximo var pós-fim / var baseline final", min_value=1.0, max_value=10.0, value=1.5, step=0.1)
+
+    st.divider()
+    st.subheader("Eventos G1/G2 (picos)")
+    peak_search_offset_s = st.number_input("Offset início p/ buscar picos (s)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
     peak_prom = st.number_input("Prominência mínima (norma)", min_value=0.0, max_value=10.0, value=0.20, step=0.05)
     peak_min_dist_s = st.number_input("Distância mínima entre picos (s)", min_value=0.0, max_value=5.0, value=0.50, step=0.10)
 
@@ -253,9 +269,6 @@ def first_persistent(ll: np.ndarray, start: int, thr: float, R: int, mode: str):
             return i
     return None
 
-# =========================================================
-# R-grid detectors
-# =========================================================
 def make_R_list_samples(fs: float, r_min_s: float, r_max_s: float, r_step_s: float):
     if r_step_s <= 0:
         return [max(1, int(round(r_min_s * fs)))]
@@ -291,11 +304,11 @@ def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R
     start_i = int(min(candidates))
     return start_i, ll, (mu, sd, thr), A0
 
-def detect_end_markov_retro_grid(states: np.ndarray, i0_f: int, i1_f: int, W: int, R_list: list[int], k_sigma: float,
+def detect_end_markov_retro_grid(states_end: np.ndarray, i0_f: int, i1_f: int, W: int, R_list: list[int], k_sigma: float,
                                  start_i: int | None, end_agg: str):
-    n_states = int(states.max() + 1)
-    Af = transition_matrix(states[i0_f:i1_f], n_states=n_states)
-    ll = sliding_ll(states, Af, W=W)
+    n_states = int(states_end.max() + 1)
+    Af = transition_matrix(states_end[i0_f:i1_f], n_states=n_states)
+    ll = sliding_ll(states_end, Af, W=W)
 
     ref = ll[i0_f:i1_f]
     ref = ref[np.isfinite(ref)]
@@ -322,11 +335,34 @@ def detect_end_markov_retro_grid(states: np.ndarray, i0_f: int, i1_f: int, W: in
     if not candidates:
         return None, ll, (mu, sd, thr), Af
 
-    if end_agg == "earliest":
-        end_i = int(min(candidates))
-    else:
-        end_i = int(max(candidates))
+    end_i = int(max(candidates) if end_agg == "latest" else min(candidates))
     return end_i, ll, (mu, sd, thr), Af
+
+# ---------- gates for END ----------
+def has_strong_movement_before(states_end: np.ndarray, idx: int, fs: float, lookback_s: float, run_s: float, min_state: int):
+    lookback = int(round(lookback_s * fs))
+    run_len = max(1, int(round(run_s * fs)))
+    i0 = max(0, idx - lookback)
+    x = states_end[i0:idx]
+    run = 0
+    for s in x:
+        if int(s) >= int(min_state):
+            run += 1
+            if run >= run_len:
+                return True
+        else:
+            run = 0
+    return False
+
+def quietness_gate(norm: np.ndarray, fs: float, end_i: int, i0_f: int, i1_f: int, win_s: float, factor: float):
+    Wq = max(2, int(round(win_s * fs)))
+    var_final = float(np.var(norm[i0_f:i1_f])) if (i1_f > i0_f + 2) else np.nan
+    j0 = end_i
+    j1 = min(len(norm), end_i + Wq)
+    if j1 <= j0 + 1 or not np.isfinite(var_final) or var_final <= 0:
+        return True  # se não dá pra avaliar, não bloqueia
+    var_after = float(np.var(norm[j0:j1]))
+    return var_after <= factor * var_final
 
 # =========================================================
 # G1/G2 + components via RETURN-STATE runs
@@ -401,7 +437,6 @@ run_len = max(1, int(round(run_state_s * fs)))
 return_state = int(return_state)
 
 peak_offset_samples = int(round(peak_search_offset_s * fs))
-peak_min_dist = peak_min_dist_s
 
 results = []
 cache = {}
@@ -412,8 +447,10 @@ for up in uploads:
         df = read_gyro_txt_bytes(up.getvalue())
         t, norm = preprocess_to_norm(df, fs=fs, lowpass_hz=lowpass_hz)
 
+        # K-means único no sinal inteiro
         labels, _ = kmeans_1d(norm, k=k_states)
 
+        # -------- baseline inicial adaptativa ----------
         i0_b, i1_b, score_b = pick_quiet_window(
             norm, fs=fs, win_s=win_s,
             start_s=guard_start_s,
@@ -422,12 +459,7 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        states, _ = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)
-
-        start_i, ll_start, (_, _, thr_s), _ = detect_start_markov_grid(
-            states, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
-        )
-
+        # -------- baseline final adaptativa ----------
         total_s = float(t[-1] - t[0])
         end_region_start_s = max(0.0, total_s - search_last_s)
         end_region_end_s = max(0.0, total_s - guard_end_s)
@@ -440,15 +472,48 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        end_i, ll_end, (_, _, thr_e), _ = detect_end_markov_retro_grid(
-            states, i0_f=i0_f, i1_f=i1_f, W=W, R_list=R_list, k_sigma=k_sigma_end,
+        # ✅ DOIS MAPAS DE ESTADOS
+        states_start, base_label_start = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)  # repouso inicial = 0
+        states_end, base_label_end = relabel_baseline_as_zero(labels, i0=i0_f, i1=i1_f)      # repouso final   = 0
+
+        # ---- start usando states_start ----
+        start_i, ll_start, (_, _, thr_s), _ = detect_start_markov_grid(
+            states_start, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
+        )
+
+        # ---- end usando states_end ----
+        end_i_raw, ll_end, (_, _, thr_e), _ = detect_end_markov_retro_grid(
+            states_end, i0_f=i0_f, i1_f=i1_f, W=W, R_list=R_list, k_sigma=k_sigma_end,
             start_i=start_i, end_agg=end_agg
         )
+
+        # aplica gates no fim (se existir candidato)
+        end_i = end_i_raw
+        if end_i is not None:
+            ok = True
+
+            if use_strong_move_gate:
+                ok = ok and has_strong_movement_before(
+                    states_end, idx=end_i, fs=fs,
+                    lookback_s=strong_lookback_s,
+                    run_s=strong_run_s,
+                    min_state=int(strong_state_min)
+                )
+
+            if use_quiet_gate and ok:
+                ok = ok and quietness_gate(
+                    norm=norm, fs=fs,
+                    end_i=end_i, i0_f=i0_f, i1_f=i1_f,
+                    win_s=quiet_win_s, factor=quiet_factor
+                )
+
+            if not ok:
+                end_i = None
 
         if end_event_as_last_movement and end_i is not None:
             end_i = max(0, end_i - 1)
 
-        # ✅ janela de picos começa em start_i + 2s (offset)
+        # ---- janela de picos: (start + offset) até end ----
         peak_start_i = None
         if start_i is not None:
             peak_start_i = min(len(norm) - 1, start_i + peak_offset_samples)
@@ -459,17 +524,20 @@ for up in uploads:
             i_end=end_i if end_i is not None else None,
             fs=fs,
             prom=peak_prom,
-            min_dist_s=peak_min_dist,
+            min_dist_s=peak_min_dist_s,
         )
 
+        # Delimitação de componentes (use states_start ou states_end?)
+        # Aqui é melhor usar states_start (repouso inicial=0), mas como você pediu delimitar por retorno ao estado 1,
+        # tanto faz desde que "estado 1" exista e seja coerente. Mantive states_start por consistência com início.
         g1_cs = g1_ce = g2_cs = g2_ce = None
         if g1_i is not None and start_i is not None and end_i is not None:
             g1_cs, g1_ce = component_bounds_from_runs(
-                states, peak_i=g1_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
+                states_start, peak_i=g1_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
             )
         if g2_i is not None and start_i is not None and end_i is not None:
             g2_cs, g2_ce = component_bounds_from_runs(
-                states, peak_i=g2_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
+                states_start, peak_i=g2_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
             )
 
         def safe_time(idx):
@@ -492,41 +560,35 @@ for up in uploads:
             "end_s": end_t,
             "duration_s": dur,
 
+            "base_label_start(kmeans)": int(base_label_start),
+            "base_label_end(kmeans)": int(base_label_end),
+
             "peak_search_start_s": safe_time(peak_start_i),
 
             "G1_time_s": safe_time(g1_i),
             "G1_value": safe_val(g1_i),
             "G1_comp_start_s": safe_time(g1_cs),
             "G1_comp_end_s": safe_time(g1_ce),
-            "G1_comp_dur_s": safe_time(g1_ce) - safe_time(g1_cs) if (g1_cs is not None and g1_ce is not None) else np.nan,
 
             "G2_time_s": safe_time(g2_i),
             "G2_value": safe_val(g2_i),
             "G2_comp_start_s": safe_time(g2_cs),
             "G2_comp_end_s": safe_time(g2_ce),
-            "G2_comp_dur_s": safe_time(g2_ce) - safe_time(g2_cs) if (g2_cs is not None and g2_ce is not None) else np.nan,
-
-            "return_state": return_state,
-            "run_len_samples": int(run_len),
-
-            "initBL_t0_s": float(t[i0_b]),
-            "initBL_t1_s": float(t[i1_b - 1]),
-            "finalBL_t0_s": float(t[i0_f]),
-            "finalBL_t1_s": float(t[i1_f - 1]),
 
             "thr_start": float(thr_s) if np.isfinite(thr_s) else np.nan,
             "thr_end": float(thr_e) if np.isfinite(thr_e) else np.nan,
             "W_samples": int(W),
             "R_list_samples": ",".join(map(str, R_list)),
-            "n_samples_100Hz": int(len(t)),
         })
 
         cache[name] = dict(
-            t=t, norm=norm, states=states,
+            t=t, norm=norm,
+            labels=labels,
+            states_start=states_start, states_end=states_end,
             ll_start=ll_start, ll_end=ll_end,
             i0_b=i0_b, i1_b=i1_b,
             i0_f=i0_f, i1_f=i1_f,
-            start_i=start_i, end_i=end_i,
+            start_i=start_i, end_i=end_i, end_i_raw=end_i_raw,
             peak_start_i=peak_start_i,
             thr_s=thr_s, thr_e=thr_e,
             g1_i=g1_i, g2_i=g2_i,
@@ -534,6 +596,10 @@ for up in uploads:
             g2_cs=g2_cs, g2_ce=g2_ce,
             return_state=return_state,
             run_len=run_len,
+            gate_strong=use_strong_move_gate,
+            gate_quiet=use_quiet_gate,
+            strong_params=(strong_state_min, strong_lookback_s, strong_run_s),
+            quiet_params=(quiet_win_s, quiet_factor),
         )
 
     except Exception as e:
@@ -548,7 +614,7 @@ csv_bytes = res_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️ Baixar CSV (resultados)",
     data=csv_bytes,
-    file_name="markov_tug_results_streamlit_with_G1G2_offset2s.csv",
+    file_name="markov_tug_results_streamlit_fixed_end.csv",
     mime="text/csv"
 )
 
@@ -569,6 +635,7 @@ ll_end = d["ll_end"]
 i0_b, i1_b = d["i0_b"], d["i1_b"]
 i0_f, i1_f = d["i0_f"], d["i1_f"]
 start_i, end_i = d["start_i"], d["end_i"]
+end_i_raw = d["end_i_raw"]
 peak_start_i = d["peak_start_i"]
 
 g1_i, g2_i = d["g1_i"], d["g2_i"]
@@ -583,70 +650,68 @@ with colA:
     fig = plt.figure(figsize=(7, 3))
     plt.plot(t, norm)
 
-    plt.axvspan(t[i0_b], t[i1_b - 1], alpha=0.2)
-    plt.axvspan(t[i0_f], t[i1_f - 1], alpha=0.2)
+    plt.axvspan(t[i0_b], t[i1_b - 1], alpha=0.2, label="baseline inicial")
+    plt.axvspan(t[i0_f], t[i1_f - 1], alpha=0.2, label="baseline final")
 
     if start_i is not None:
-        plt.axvline(t[start_i])
+        plt.axvline(t[start_i], label="start")
     if peak_start_i is not None:
-        plt.axvline(t[peak_start_i], linestyle=":")
+        plt.axvline(t[peak_start_i], linestyle=":", label="start+offset")
+    if end_i_raw is not None:
+        plt.axvline(t[end_i_raw], linestyle="--", label="end candidato")
     if end_i is not None:
-        plt.axvline(t[end_i])
+        plt.axvline(t[end_i], label="end (aceito)")
 
     if g1_i is not None:
-        plt.axvline(t[g1_i], linestyle="--")
+        plt.axvline(t[g1_i], linestyle="--", label="G1")
         if g1_cs is not None and g1_ce is not None:
             plt.axvspan(t[g1_cs], t[g1_ce], alpha=0.15)
 
     if g2_i is not None:
-        plt.axvline(t[g2_i], linestyle="--")
+        plt.axvline(t[g2_i], linestyle="--", label="G2")
         if g2_cs is not None and g2_ce is not None:
             plt.axvspan(t[g2_cs], t[g2_ce], alpha=0.15)
 
     plt.xlabel("Tempo (s)")
     plt.ylabel("Norma do giroscópio")
-    plt.title("Norma + baselines + start/end + (start+2s) + G1/G2")
+    plt.title("Norma + baselines + start/end + eventos")
+    plt.legend(fontsize=7, loc="best")
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 with colB:
     fig = plt.figure(figsize=(7, 3))
-    plt.plot(t, ll_start, label="LL (baseline inicial)")
+    plt.plot(t, ll_start, label="LL (repouso inicial; states_start)")
     if np.isfinite(thr_s):
         plt.axhline(thr_s, linestyle="--", label="thr início")
 
-    plt.plot(t, ll_end, label="LL (baseline final)")
+    plt.plot(t, ll_end, label="LL (repouso final; states_end)")
     if np.isfinite(thr_e):
         plt.axhline(thr_e, linestyle="--", label="thr fim")
 
     if start_i is not None:
-        plt.axvline(t[start_i])
-    if peak_start_i is not None:
-        plt.axvline(t[peak_start_i], linestyle=":")
+        plt.axvline(t[start_i], label="start")
+    if end_i_raw is not None:
+        plt.axvline(t[end_i_raw], linestyle="--", label="end candidato")
     if end_i is not None:
-        plt.axvline(t[end_i])
-
-    if g1_i is not None:
-        plt.axvline(t[g1_i], linestyle="--")
-    if g2_i is not None:
-        plt.axvline(t[g2_i], linestyle="--")
+        plt.axvline(t[end_i], label="end (aceito)")
 
     plt.xlabel("Tempo (s)")
     plt.ylabel("Sliding log-likelihood")
-    plt.title("LL inicial vs LL final + eventos")
-    plt.legend(fontsize=8, loc="best")
+    plt.title("LL inicial vs LL final (com states separados)")
+    plt.legend(fontsize=7, loc="best")
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
 if show_debug:
     st.markdown("### 🧪 Debug")
     st.write({
-        "peak_search_offset_s": peak_search_offset_s,
-        "peak_start_i": None if peak_start_i is None else int(peak_start_i),
+        "base_label_start(kmeans)": int(d["base_label_start(kmeans)"]) if "base_label_start(kmeans)" in d else None,
+        "base_label_end(kmeans)": int(d["base_label_end(kmeans)"]) if "base_label_end(kmeans)" in d else None,
         "start_i": None if start_i is None else int(start_i),
-        "end_i": None if end_i is None else int(end_i),
-        "g1_i": None if g1_i is None else int(g1_i),
-        "g2_i": None if g2_i is None else int(g2_i),
-        "return_state": d["return_state"],
-        "run_len_samples": int(d["run_len"]),
+        "end_i_raw": None if end_i_raw is None else int(end_i_raw),
+        "end_i_accepted": None if end_i is None else int(end_i),
+        "gates": {"strong": d["gate_strong"], "quiet": d["gate_quiet"]},
+        "strong_params": d["strong_params"],
+        "quiet_params": d["quiet_params"],
     })
