@@ -5,25 +5,23 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from scipy.signal import detrend, butter, filtfilt
+from scipy.signal import detrend, butter, filtfilt, find_peaks
 from scipy.interpolate import interp1d
 
 # =========================================================
 # Streamlit UI
 # =========================================================
-st.set_page_config(page_title="TUG Markov (Adaptive Baselines + R-grid)", layout="wide")
-st.title("📱 TUG — Segmentação por Cadeia de Markov (Baselines adaptativos + LL + loop em R)")
+st.set_page_config(page_title="TUG Markov + Eventos (G1/G2)", layout="wide")
+st.title("📱 TUG — Markov (baselines adaptativos + LL + R-grid) + Eventos G1/G2")
 
 st.markdown(
     """
-**O que este app faz (robusto):**
-- Baseline **inicial** e **final** são escolhidos automaticamente como as janelas de **menor variância** da norma.
-- O início (start) é detectado por **queda persistente** da LL sob o Markov do baseline inicial.
-- O fim (end) é detectado por **compatibilidade persistente** da LL sob o Markov do baseline final, com **busca retrógrada**.
-- Para aumentar robustez, o app faz um **loop for em várias persistências R** (R-grid) e:
-  - **Start:** escolhe o **mais cedo** entre os candidatos (menor índice).
-  - **End:** por padrão escolhe o **mais tarde** entre os candidatos (maior índice), pois é o “último retorno ao repouso”.
-    (você pode trocar para “mais cedo” se quiser)
+**Etapas:**
+- Preprocessamento: detrend → interpolação p/ 100 Hz → low-pass 15 Hz → norma
+- Discretização: k-means 1D (K estados) e relabel do estado 0 (repouso inicial)
+- Start/End: Markov + log-verossimilhança (LL) com loop em R (persistência)
+- Eventos: busca de **dois picos** entre start e end: **G1 (primeiro)** e **G2 (último)**  
+  e delimitação do componente de cada pico via **sequência curta de estado 0** (para trás/para frente)
 """
 )
 
@@ -64,10 +62,18 @@ with st.sidebar:
     r_step_s = st.number_input("Passo R (s)", min_value=0.01, max_value=0.50, value=0.01, step=0.01)
 
     end_aggregator = st.selectbox(
-        "Como escolher o fim entre os candidatos?",
+        "Como escolher o fim entre candidatos?",
         options=["mais tarde (recomendado)", "mais cedo"],
         index=0
     )
+
+    st.divider()
+    st.subheader("Eventos G1/G2 (picos)")
+    peak_prom = st.number_input("Prominência mínima (norma)", min_value=0.0, max_value=10.0, value=0.20, step=0.05)
+    peak_min_dist_s = st.number_input("Distância mínima entre picos (s)", min_value=0.0, max_value=5.0, value=0.50, step=0.10)
+
+    st.subheader("Componente via estado 0")
+    zero_run_s = st.number_input("Tamanho da sequência curta de estado 0 (s)", min_value=0.01, max_value=1.00, value=0.10, step=0.01)
 
     st.divider()
     st.subheader("Opções")
@@ -113,7 +119,6 @@ def preprocess_to_norm(df: pd.DataFrame, fs: float, lowpass_hz: float):
     order = np.argsort(t)
     t, x, y, z = t[order], x[order], y[order], z[order]
 
-    # remove duplicates in time
     _, idx = np.unique(t, return_index=True)
     t, x, y, z = t[idx], x[idx], y[idx], z[idx]
 
@@ -139,7 +144,6 @@ def preprocess_to_norm(df: pd.DataFrame, fs: float, lowpass_hz: float):
 def kmeans_1d(x: np.ndarray, k: int, max_iter: int = 40, tol: float = 1e-6):
     qs = np.linspace(0.0, 1.0, k + 2)[1:-1]
     centers = np.quantile(x, qs).astype(float)
-
     for _ in range(max_iter):
         d = np.abs(x[:, None] - centers[None, :])
         labels = np.argmin(d, axis=1)
@@ -157,7 +161,6 @@ def kmeans_1d(x: np.ndarray, k: int, max_iter: int = 40, tol: float = 1e-6):
         if shift < tol:
             break
 
-    # reorder by center magnitude
     order = np.argsort(centers)
     centers = centers[order]
     inv = np.empty_like(order)
@@ -167,10 +170,6 @@ def kmeans_1d(x: np.ndarray, k: int, max_iter: int = 40, tol: float = 1e-6):
 
 def pick_quiet_window(norm: np.ndarray, fs: float, win_s: float, start_s: float, end_s: float,
                       step_s: float, use_mean_penalty: bool, lam: float):
-    """
-    Escolhe janela de menor variância (ou var + lam*mean^2) entre [start_s, end_s].
-    Retorna (i0, i1, score).
-    """
     n = len(norm)
     Wn = int(round(win_s * fs))
     step = max(1, int(round(step_s * fs)))
@@ -232,7 +231,6 @@ def transition_matrix(seq: np.ndarray, n_states: int, eps: float = 1e-10):
     return A
 
 def sliding_ll(seq: np.ndarray, A: np.ndarray, W: int):
-    # LL over transitions in a sliding window of length W transitions
     lp = np.log(A[seq[:-1], seq[1:]])
     cs = np.concatenate([[0.0], np.cumsum(lp)])
     ll = np.full(seq.shape[0], np.nan, float)
@@ -241,11 +239,6 @@ def sliding_ll(seq: np.ndarray, A: np.ndarray, W: int):
     return ll
 
 def first_persistent(ll: np.ndarray, start: int, thr: float, R: int, mode: str):
-    """
-    Returns first index i >= start such that ll[i:i+R] persistently:
-      mode="lt": < thr
-      mode="ge": >= thr
-    """
     for i in range(start, len(ll) - R):
         w = ll[i:i + R]
         if not np.all(np.isfinite(w)):
@@ -257,7 +250,7 @@ def first_persistent(ll: np.ndarray, start: int, thr: float, R: int, mode: str):
     return None
 
 # =========================================================
-# R-grid detectors (your idea)
+# R-grid detectors
 # =========================================================
 def make_R_list_samples(fs: float, r_min_s: float, r_max_s: float, r_step_s: float):
     if r_step_s <= 0:
@@ -266,16 +259,9 @@ def make_R_list_samples(fs: float, r_min_s: float, r_max_s: float, r_step_s: flo
         r_max_s = r_min_s
     r_vals = np.arange(r_min_s, r_max_s + 1e-12, r_step_s)
     R_list = [max(1, int(round(fs * r))) for r in r_vals]
-    # unique, sorted
-    R_list = sorted(list(set(R_list)))
-    return R_list
+    return sorted(list(set(R_list)))
 
 def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R_list: list[int], k_sigma: float):
-    """
-    Fit Markov on initial baseline.
-    Find start candidates for each R in R_list, then choose the EARLIEST (min index).
-    Search ALWAYS starts after baseline end (+W) to avoid early detection.
-    """
     n_states = int(states.max() + 1)
     A0 = transition_matrix(states[i0_b:i1_b], n_states=n_states)
     ll = sliding_ll(states, A0, W=W)
@@ -290,7 +276,7 @@ def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R
 
     candidates = []
     for R in R_list:
-        start_search = max(i1_b + W, 0)
+        start_search = max(i1_b + W, 0)  # sempre após baseline + W
         idx = first_persistent(ll, start=start_search, thr=thr, R=R, mode="lt")
         if idx is not None and idx >= i1_b:
             candidates.append(idx)
@@ -298,19 +284,11 @@ def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R
     if not candidates:
         return None, ll, (mu, sd, thr), A0
 
-    start_i = int(min(candidates))  # your "momento inferior"
+    start_i = int(min(candidates))  # mais cedo
     return start_i, ll, (mu, sd, thr), A0
 
 def detect_end_markov_retro_grid(states: np.ndarray, i0_f: int, i1_f: int, W: int, R_list: list[int], k_sigma: float,
                                  start_i: int | None, end_agg: str):
-    """
-    Fit Markov on final baseline.
-    Retro-scan for each R; candidates are indices where ll[i:i+R] >= thr.
-    IMPORTANT: restrict search to BEFORE the start of final baseline (<= i0_f).
-    Aggregation:
-      - 'latest' (recommended): choose max(candidates) (closest to final rest)
-      - 'earliest': choose min(candidates)
-    """
     n_states = int(states.max() + 1)
     Af = transition_matrix(states[i0_f:i1_f], n_states=n_states)
     ll = sliding_ll(states, Af, W=W)
@@ -327,7 +305,7 @@ def detect_end_markov_retro_grid(states: np.ndarray, i0_f: int, i1_f: int, W: in
 
     candidates = []
     for R in R_list:
-        max_i = max(min_i, i0_f - R - 1)  # do not search after baseline start
+        max_i = max(min_i, i0_f - R - 1)  # limitar até antes do baseline final
         idx = None
         for i in range(max_i, min_i, -1):
             w = ll[i:i + R]
@@ -343,8 +321,83 @@ def detect_end_markov_retro_grid(states: np.ndarray, i0_f: int, i1_f: int, W: in
     if end_agg == "earliest":
         end_i = int(min(candidates))
     else:
-        end_i = int(max(candidates))  # recommended
+        end_i = int(max(candidates))  # recomendado
     return end_i, ll, (mu, sd, thr), Af
+
+# =========================================================
+# G1/G2 peaks + component boundaries via zero-runs
+# =========================================================
+def find_two_peaks(norm: np.ndarray, i_start: int, i_end: int, fs: float, prom: float, min_dist_s: float):
+    """
+    Find peaks in norm between [i_start, i_end]. Return two peak indices (global):
+    G1 = earliest, G2 = latest (among detected peaks).
+    """
+    if i_start is None or i_end is None:
+        return None, None
+
+    i_start = int(max(0, i_start))
+    i_end = int(min(len(norm) - 1, i_end))
+    if i_end - i_start < 5:
+        return None, None
+
+    seg = norm[i_start:i_end + 1]
+    dist = int(round(min_dist_s * fs))
+    dist = max(1, dist)
+
+    peaks, props = find_peaks(seg, prominence=prom, distance=dist)
+    if len(peaks) < 2:
+        return None, None
+
+    peaks_global = peaks + i_start
+    peaks_global = np.sort(peaks_global)
+
+    g1 = int(peaks_global[0])
+    g2 = int(peaks_global[-1])
+    if g1 == g2:
+        return None, None
+    return g1, g2
+
+def last_zero_run_end_before(states: np.ndarray, peak_i: int, i_min: int, run_len: int):
+    """
+    Find the last index j <= peak_i-1 such that states[j-run_len+1 : j+1] are all zero.
+    Return j (end of the zero-run). If not found, return None.
+    """
+    start = max(i_min + run_len - 1, 0)
+    end = min(peak_i - 1, len(states) - 1)
+    for j in range(end, start - 1, -1):
+        if np.all(states[j - run_len + 1: j + 1] == 0):
+            return j
+    return None
+
+def first_zero_run_start_after(states: np.ndarray, peak_i: int, i_max: int, run_len: int):
+    """
+    Find the first index j >= peak_i+1 such that states[j : j+run_len] are all zero.
+    Return j (start of the zero-run). If not found, return None.
+    """
+    j_start = max(peak_i + 1, 0)
+    j_end = min(i_max - run_len + 1, len(states) - run_len)
+    for j in range(j_start, j_end + 1):
+        if np.all(states[j: j + run_len] == 0):
+            return j
+    return None
+
+def component_bounds_from_zero_runs(states: np.ndarray, peak_i: int, i_start: int, i_end: int, run_len: int):
+    """
+    Define component around peak_i using zero-run bracketing within [i_start, i_end].
+    component_start = last_zero_run_end_before + 1
+    component_end   = first_zero_run_start_after - 1
+    If zero-runs not found, fallback to i_start/i_end.
+    """
+    z_end = last_zero_run_end_before(states, peak_i, i_min=i_start, run_len=run_len)
+    z_start = first_zero_run_start_after(states, peak_i, i_max=i_end, run_len=run_len)
+
+    comp_start = (z_end + 1) if z_end is not None else i_start
+    comp_end = (z_start - 1) if z_start is not None else i_end
+
+    comp_start = int(max(i_start, min(peak_i, comp_start)))
+    comp_end = int(min(i_end, max(peak_i, comp_end)))
+
+    return comp_start, comp_end, z_end, z_start
 
 # =========================================================
 # Run
@@ -360,10 +413,12 @@ if W < 1:
 
 R_list = make_R_list_samples(fs, r_min_s, r_max_s, r_step_s)
 if len(R_list) == 0:
-    st.error("R_list ficou vazio. Verifique r_min_s / r_max_s / r_step_s.")
+    st.error("R_list vazio. Verifique r_min_s / r_max_s / r_step_s.")
     st.stop()
 
 end_agg = "latest" if end_aggregator.startswith("mais tarde") else "earliest"
+peak_min_dist = peak_min_dist_s
+zero_run_len = max(1, int(round(zero_run_s * fs)))
 
 results = []
 cache = {}
@@ -376,7 +431,7 @@ for up in uploads:
 
         labels, _ = kmeans_1d(norm, k=k_states)
 
-        # Adaptive initial baseline: within first [guard_start, search_first]
+        # Baseline inicial adaptativo
         i0_b, i1_b, score_b = pick_quiet_window(
             norm, fs=fs, win_s=win_s,
             start_s=guard_start_s,
@@ -385,16 +440,16 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        # relabel state 0 using initial baseline window
+        # Estado 0 (repouso inicial)
         states, base_label = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)
 
-        # START (R-grid, choose earliest)
+        # START (Markov + R-grid)
         start_i, ll_start, (mu_s, sd_s, thr_s), _ = detect_start_markov_grid(
             states, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
         )
         start_t = float(t[start_i]) if start_i is not None else np.nan
 
-        # Adaptive final baseline region in seconds
+        # Baseline final adaptativo
         total_s = float(t[-1] - t[0])
         end_region_start_s = max(0.0, total_s - search_last_s)
         end_region_end_s = max(0.0, total_s - guard_end_s)
@@ -407,44 +462,98 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        # END (R-grid, retro, aggregated)
+        # END (Markov + R-grid + retro)
         end_i, ll_end, (mu_e, sd_e, thr_e), _ = detect_end_markov_retro_grid(
             states, i0_f=i0_f, i1_f=i1_f, W=W, R_list=R_list, k_sigma=k_sigma_end,
             start_i=start_i, end_agg=end_agg
         )
 
-        # Optional: define end as last movement sample before entry into rest
         if end_event_as_last_movement and end_i is not None:
             end_i = max(0, end_i - 1)
 
         end_t = float(t[end_i]) if end_i is not None else np.nan
         dur = float(end_t - start_t) if np.isfinite(start_t) and np.isfinite(end_t) else np.nan
 
+        # -------------------------
+        # Eventos G1/G2 entre start e end
+        # -------------------------
+        g1_i, g2_i = find_two_peaks(
+            norm=norm,
+            i_start=start_i if start_i is not None else None,
+            i_end=end_i if end_i is not None else None,
+            fs=fs,
+            prom=peak_prom,
+            min_dist_s=peak_min_dist,
+        )
+
+        # Component bounds via zero runs
+        g1_cs = g1_ce = g2_cs = g2_ce = None
+        g1_zend = g1_zstart = g2_zend = g2_zstart = None
+
+        if g1_i is not None and start_i is not None and end_i is not None:
+            g1_cs, g1_ce, g1_zend, g1_zstart = component_bounds_from_zero_runs(
+                states, peak_i=g1_i, i_start=start_i, i_end=end_i, run_len=zero_run_len
+            )
+        if g2_i is not None and start_i is not None and end_i is not None:
+            g2_cs, g2_ce, g2_zend, g2_zstart = component_bounds_from_zero_runs(
+                states, peak_i=g2_i, i_start=start_i, i_end=end_i, run_len=zero_run_len
+            )
+
+        def safe_time(idx):
+            if idx is None or idx < 0 or idx >= len(t):
+                return np.nan
+            return float(t[idx])
+
+        def safe_val(idx):
+            if idx is None or idx < 0 or idx >= len(norm):
+                return np.nan
+            return float(norm[idx])
+
         results.append({
             "file": name,
             "start_s": start_t,
             "end_s": end_t,
             "duration_s": dur,
+
+            "G1_time_s": safe_time(g1_i),
+            "G1_value": safe_val(g1_i),
+            "G1_comp_start_s": safe_time(g1_cs),
+            "G1_comp_end_s": safe_time(g1_ce),
+            "G1_comp_dur_s": safe_time(g1_ce) - safe_time(g1_cs) if (g1_cs is not None and g1_ce is not None) else np.nan,
+
+            "G2_time_s": safe_time(g2_i),
+            "G2_value": safe_val(g2_i),
+            "G2_comp_start_s": safe_time(g2_cs),
+            "G2_comp_end_s": safe_time(g2_ce),
+            "G2_comp_dur_s": safe_time(g2_ce) - safe_time(g2_cs) if (g2_cs is not None and g2_ce is not None) else np.nan,
+
             "initBL_t0_s": float(t[i0_b]),
             "initBL_t1_s": float(t[i1_b - 1]),
             "initBL_score": float(score_b),
+
             "finalBL_t0_s": float(t[i0_f]),
             "finalBL_t1_s": float(t[i1_f - 1]),
             "finalBL_score": float(score_f),
+
             "thr_start": float(thr_s) if np.isfinite(thr_s) else np.nan,
             "thr_end": float(thr_e) if np.isfinite(thr_e) else np.nan,
-            "R_list_samples": ",".join(map(str, R_list)),
+
             "W_samples": int(W),
+            "R_list_samples": ",".join(map(str, R_list)),
+            "zero_run_len_samples": int(zero_run_len),
             "n_samples_100Hz": int(len(t)),
         })
 
         cache[name] = dict(
-            t=t, norm=norm,
+            t=t, norm=norm, states=states,
             ll_start=ll_start, ll_end=ll_end,
             i0_b=i0_b, i1_b=i1_b,
             i0_f=i0_f, i1_f=i1_f,
             start_i=start_i, end_i=end_i,
-            thr_s=thr_s, thr_e=thr_e
+            thr_s=thr_s, thr_e=thr_e,
+            g1_i=g1_i, g2_i=g2_i,
+            g1_cs=g1_cs, g1_ce=g1_ce,
+            g2_cs=g2_cs, g2_ce=g2_ce,
         )
 
     except Exception as e:
@@ -459,7 +568,7 @@ csv_bytes = res_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️ Baixar CSV (resultados)",
     data=csv_bytes,
-    file_name="markov_tug_results_streamlit_Rgrid.csv",
+    file_name="markov_tug_results_streamlit_with_G1G2.csv",
     mime="text/csv"
 )
 
@@ -471,32 +580,52 @@ if not ok_files:
 st.subheader("📈 Visualização por arquivo")
 sel = st.selectbox("Escolha o arquivo", ok_files)
 
-data = cache[sel]
-t = data["t"]
-norm = data["norm"]
-ll_start = data["ll_start"]
-ll_end = data["ll_end"]
-i0_b, i1_b = data["i0_b"], data["i1_b"]
-i0_f, i1_f = data["i0_f"], data["i1_f"]
-start_i, end_i = data["start_i"], data["end_i"]
-thr_s, thr_e = data["thr_s"], data["thr_e"]
+d = cache[sel]
+t = d["t"]
+norm = d["norm"]
+states = d["states"]
+ll_start = d["ll_start"]
+ll_end = d["ll_end"]
+
+i0_b, i1_b = d["i0_b"], d["i1_b"]
+i0_f, i1_f = d["i0_f"], d["i1_f"]
+start_i, end_i = d["start_i"], d["end_i"]
+thr_s, thr_e = d["thr_s"], d["thr_e"]
+
+g1_i, g2_i = d["g1_i"], d["g2_i"]
+g1_cs, g1_ce = d["g1_cs"], d["g1_ce"]
+g2_cs, g2_ce = d["g2_cs"], d["g2_ce"]
 
 colA, colB = st.columns(2)
 
 with colA:
     fig = plt.figure(figsize=(7, 3))
     plt.plot(t, norm)
+
     # baselines
     plt.axvspan(t[i0_b], t[i1_b - 1], alpha=0.2)
     plt.axvspan(t[i0_f], t[i1_f - 1], alpha=0.2)
-    # events
+
+    # start/end
     if start_i is not None:
         plt.axvline(t[start_i])
     if end_i is not None:
         plt.axvline(t[end_i])
+
+    # G1/G2 peaks + components
+    if g1_i is not None:
+        plt.axvline(t[g1_i], linestyle="--")
+        if g1_cs is not None and g1_ce is not None:
+            plt.axvspan(t[g1_cs], t[g1_ce], alpha=0.15)
+
+    if g2_i is not None:
+        plt.axvline(t[g2_i], linestyle="--")
+        if g2_cs is not None and g2_ce is not None:
+            plt.axvspan(t[g2_cs], t[g2_ce], alpha=0.15)
+
     plt.xlabel("Tempo (s)")
     plt.ylabel("Norma do giroscópio")
-    plt.title("Norma + baselines adaptativos + start/end")
+    plt.title("Norma + baselines + start/end + G1/G2 + componentes")
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
@@ -505,16 +634,24 @@ with colB:
     plt.plot(t, ll_start, label="LL (baseline inicial)")
     if np.isfinite(thr_s):
         plt.axhline(thr_s, linestyle="--", label="thr início")
+
     plt.plot(t, ll_end, label="LL (baseline final)")
     if np.isfinite(thr_e):
         plt.axhline(thr_e, linestyle="--", label="thr fim")
+
     if start_i is not None:
         plt.axvline(t[start_i])
     if end_i is not None:
         plt.axvline(t[end_i])
+
+    if g1_i is not None:
+        plt.axvline(t[g1_i], linestyle="--")
+    if g2_i is not None:
+        plt.axvline(t[g2_i], linestyle="--")
+
     plt.xlabel("Tempo (s)")
     plt.ylabel("Sliding log-likelihood")
-    plt.title("LL inicial vs LL final (Markov)")
+    plt.title("LL inicial vs LL final + eventos")
     plt.legend(fontsize=8, loc="best")
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
@@ -522,15 +659,11 @@ with colB:
 if show_debug:
     st.markdown("### 🧪 Debug")
     st.write({
-        "W_samples": int(W),
+        "W_samples": int(d["W_samples"]) if "W_samples" in d else int(W),
         "R_list_samples": R_list,
-        "init_baseline_idx": (int(i0_b), int(i1_b)),
-        "final_baseline_idx": (int(i0_f), int(i1_f)),
+        "zero_run_len_samples": int(zero_run_len),
         "start_idx": None if start_i is None else int(start_i),
         "end_idx": None if end_i is None else int(end_i),
-        "start_search_from_idx": int(i1_b + W),
-        "end_search_max_idx": int(i0_f - 1),
-        "thr_start": float(thr_s) if np.isfinite(thr_s) else None,
-        "thr_end": float(thr_e) if np.isfinite(thr_e) else None,
-        "end_aggregator": end_agg,
+        "g1_idx": None if g1_i is None else int(g1_i),
+        "g2_idx": None if g2_i is None else int(g2_i),
     })
