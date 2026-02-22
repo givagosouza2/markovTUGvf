@@ -20,7 +20,7 @@ st.markdown(
 - Preprocessamento: detrend → interpolação p/ 100 Hz → low-pass 15 Hz → norma
 - Discretização: k-means 1D (K estados) e relabel do estado 0 (repouso inicial)
 - Start/End: Markov + log-verossimilhança (LL) com loop em R (persistência)
-- Eventos: busca de **dois picos** entre start e end: **G1 (primeiro)** e **G2 (último)**  
+- Eventos: busca de **dois picos** entre **(start + offset)** e **end**: **G1 (primeiro)** e **G2 (último)**  
   e delimitação do componente de cada pico via **sequência curta de retorno ao estado escolhido** (padrão = estado 1)
 """
 )
@@ -69,6 +69,9 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Eventos G1/G2 (picos)")
+    # ✅ mudança solicitada: offset fixo de 2 s (deixo parametrizável)
+    peak_search_offset_s = st.number_input("Offset início p/ buscar picos (s)", min_value=0.0, max_value=10.0, value=2.0, step=0.5)
+
     peak_prom = st.number_input("Prominência mínima (norma)", min_value=0.0, max_value=10.0, value=0.20, step=0.05)
     peak_min_dist_s = st.number_input("Distância mínima entre picos (s)", min_value=0.0, max_value=5.0, value=0.50, step=0.10)
 
@@ -366,12 +369,6 @@ def first_run_start_after(states: np.ndarray, peak_i: int, i_max: int, run_len: 
     return None
 
 def component_bounds_from_runs(states: np.ndarray, peak_i: int, i_start: int, i_end: int, run_len: int, return_state: int):
-    """
-    Delimita componente usando runs do return_state (padrão=1):
-      comp_start = last_run_end_before + 1
-      comp_end   = first_run_start_after - 1
-    Se não encontrar run, usa fallback i_start/i_end.
-    """
     r_end = last_run_end_before(states, peak_i, i_min=i_start, run_len=run_len, state_val=return_state)
     r_start = first_run_start_after(states, peak_i, i_max=i_end, run_len=run_len, state_val=return_state)
 
@@ -380,7 +377,7 @@ def component_bounds_from_runs(states: np.ndarray, peak_i: int, i_start: int, i_
 
     comp_start = int(max(i_start, min(peak_i, comp_start)))
     comp_end = int(min(i_end, max(peak_i, comp_end)))
-    return comp_start, comp_end, r_end, r_start
+    return comp_start, comp_end
 
 # =========================================================
 # Run
@@ -400,9 +397,11 @@ if len(R_list) == 0:
     st.stop()
 
 end_agg = "latest" if end_aggregator.startswith("mais tarde") else "earliest"
-peak_min_dist = peak_min_dist_s
 run_len = max(1, int(round(run_state_s * fs)))
 return_state = int(return_state)
+
+peak_offset_samples = int(round(peak_search_offset_s * fs))
+peak_min_dist = peak_min_dist_s
 
 results = []
 cache = {}
@@ -415,7 +414,6 @@ for up in uploads:
 
         labels, _ = kmeans_1d(norm, k=k_states)
 
-        # Baseline inicial adaptativo
         i0_b, i1_b, score_b = pick_quiet_window(
             norm, fs=fs, win_s=win_s,
             start_s=guard_start_s,
@@ -424,16 +422,12 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        # Estado 0 (repouso inicial)
-        states, base_label = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)
+        states, _ = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)
 
-        # START
         start_i, ll_start, (_, _, thr_s), _ = detect_start_markov_grid(
             states, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
         )
-        start_t = float(t[start_i]) if start_i is not None else np.nan
 
-        # Baseline final adaptativo
         total_s = float(t[-1] - t[0])
         end_region_start_s = max(0.0, total_s - search_last_s)
         end_region_end_s = max(0.0, total_s - guard_end_s)
@@ -446,7 +440,6 @@ for up in uploads:
             use_mean_penalty=use_mean_penalty, lam=lam
         )
 
-        # END
         end_i, ll_end, (_, _, thr_e), _ = detect_end_markov_retro_grid(
             states, i0_f=i0_f, i1_f=i1_f, W=W, R_list=R_list, k_sigma=k_sigma_end,
             start_i=start_i, end_agg=end_agg
@@ -455,27 +448,27 @@ for up in uploads:
         if end_event_as_last_movement and end_i is not None:
             end_i = max(0, end_i - 1)
 
-        end_t = float(t[end_i]) if end_i is not None else np.nan
-        dur = float(end_t - start_t) if np.isfinite(start_t) and np.isfinite(end_t) else np.nan
+        # ✅ janela de picos começa em start_i + 2s (offset)
+        peak_start_i = None
+        if start_i is not None:
+            peak_start_i = min(len(norm) - 1, start_i + peak_offset_samples)
 
-        # Peaks G1/G2
         g1_i, g2_i = find_two_peaks(
             norm=norm,
-            i_start=start_i if start_i is not None else None,
+            i_start=peak_start_i if peak_start_i is not None else None,
             i_end=end_i if end_i is not None else None,
             fs=fs,
             prom=peak_prom,
             min_dist_s=peak_min_dist,
         )
 
-        # Components around peaks using return_state runs
         g1_cs = g1_ce = g2_cs = g2_ce = None
         if g1_i is not None and start_i is not None and end_i is not None:
-            g1_cs, g1_ce, _, _ = component_bounds_from_runs(
+            g1_cs, g1_ce = component_bounds_from_runs(
                 states, peak_i=g1_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
             )
         if g2_i is not None and start_i is not None and end_i is not None:
-            g2_cs, g2_ce, _, _ = component_bounds_from_runs(
+            g2_cs, g2_ce = component_bounds_from_runs(
                 states, peak_i=g2_i, i_start=start_i, i_end=end_i, run_len=run_len, return_state=return_state
             )
 
@@ -489,11 +482,17 @@ for up in uploads:
                 return np.nan
             return float(norm[idx])
 
+        start_t = safe_time(start_i)
+        end_t = safe_time(end_i)
+        dur = (end_t - start_t) if np.isfinite(start_t) and np.isfinite(end_t) else np.nan
+
         results.append({
             "file": name,
             "start_s": start_t,
             "end_s": end_t,
             "duration_s": dur,
+
+            "peak_search_start_s": safe_time(peak_start_i),
 
             "G1_time_s": safe_time(g1_i),
             "G1_value": safe_val(g1_i),
@@ -517,7 +516,6 @@ for up in uploads:
 
             "thr_start": float(thr_s) if np.isfinite(thr_s) else np.nan,
             "thr_end": float(thr_e) if np.isfinite(thr_e) else np.nan,
-
             "W_samples": int(W),
             "R_list_samples": ",".join(map(str, R_list)),
             "n_samples_100Hz": int(len(t)),
@@ -529,6 +527,7 @@ for up in uploads:
             i0_b=i0_b, i1_b=i1_b,
             i0_f=i0_f, i1_f=i1_f,
             start_i=start_i, end_i=end_i,
+            peak_start_i=peak_start_i,
             thr_s=thr_s, thr_e=thr_e,
             g1_i=g1_i, g2_i=g2_i,
             g1_cs=g1_cs, g1_ce=g1_ce,
@@ -549,7 +548,7 @@ csv_bytes = res_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️ Baixar CSV (resultados)",
     data=csv_bytes,
-    file_name="markov_tug_results_streamlit_with_G1G2_returnState.csv",
+    file_name="markov_tug_results_streamlit_with_G1G2_offset2s.csv",
     mime="text/csv"
 )
 
@@ -570,11 +569,13 @@ ll_end = d["ll_end"]
 i0_b, i1_b = d["i0_b"], d["i1_b"]
 i0_f, i1_f = d["i0_f"], d["i1_f"]
 start_i, end_i = d["start_i"], d["end_i"]
-thr_s, thr_e = d["thr_s"], d["thr_e"]
+peak_start_i = d["peak_start_i"]
 
 g1_i, g2_i = d["g1_i"], d["g2_i"]
 g1_cs, g1_ce = d["g1_cs"], d["g1_ce"]
 g2_cs, g2_ce = d["g2_cs"], d["g2_ce"]
+
+thr_s, thr_e = d["thr_s"], d["thr_e"]
 
 colA, colB = st.columns(2)
 
@@ -587,6 +588,8 @@ with colA:
 
     if start_i is not None:
         plt.axvline(t[start_i])
+    if peak_start_i is not None:
+        plt.axvline(t[peak_start_i], linestyle=":")
     if end_i is not None:
         plt.axvline(t[end_i])
 
@@ -602,7 +605,7 @@ with colA:
 
     plt.xlabel("Tempo (s)")
     plt.ylabel("Norma do giroscópio")
-    plt.title(f"Norma + baselines + start/end + G1/G2 (retorno ao estado {d['return_state']})")
+    plt.title("Norma + baselines + start/end + (start+2s) + G1/G2")
     plt.tight_layout()
     st.pyplot(fig, clear_figure=True)
 
@@ -618,6 +621,8 @@ with colB:
 
     if start_i is not None:
         plt.axvline(t[start_i])
+    if peak_start_i is not None:
+        plt.axvline(t[peak_start_i], linestyle=":")
     if end_i is not None:
         plt.axvline(t[end_i])
 
@@ -636,10 +641,12 @@ with colB:
 if show_debug:
     st.markdown("### 🧪 Debug")
     st.write({
+        "peak_search_offset_s": peak_search_offset_s,
+        "peak_start_i": None if peak_start_i is None else int(peak_start_i),
+        "start_i": None if start_i is None else int(start_i),
+        "end_i": None if end_i is None else int(end_i),
+        "g1_i": None if g1_i is None else int(g1_i),
+        "g2_i": None if g2_i is None else int(g2_i),
         "return_state": d["return_state"],
         "run_len_samples": int(d["run_len"]),
-        "start_idx": None if start_i is None else int(start_i),
-        "end_idx": None if end_i is None else int(end_i),
-        "g1_idx": None if g1_i is None else int(g1_i),
-        "g2_idx": None if g2_i is None else int(g2_i),
     })
