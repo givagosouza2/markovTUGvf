@@ -12,22 +12,22 @@ from scipy.interpolate import interp1d
 # Streamlit UI
 # =========================================================
 st.set_page_config(
-    page_title="TUG Markov + End (retro ancorado no repouso final) + Eventos G1/G2",
+    page_title="TUG Markov + End (retro a partir do repouso final) + Eventos G1/G2",
     layout="wide",
 )
-st.title("📱 TUG — Markov + FIM retro (ancorado no repouso final, com gaps) + eventos G1/G2")
+st.title("📱 TUG — Markov + FIM retro (a partir do repouso final, com gaps) + eventos G1/G2")
 
 st.markdown(
     """
 ### Pipeline
 1) detrend → interpolação p/ **100 Hz** → low-pass (15 Hz) → **norma** do giroscópio  
 2) **k-means 1D** na norma (K estados)  
-3) Baselines adaptativos (início) e baseline final **ancorada no fim**  
+3) Baselines adaptativos (início e fim) escolhidos como **menor variância** nas regiões definidas  
 4) Dois mapas de estados:
    - `states_start`: baseline inicial vira **0**
-   - `states_end`: baseline final vira **0** (janela final fixa antes do guard_end)
+   - `states_end`: baseline final vira **0**
 5) **Start** por Markov+LL (queda persistente após baseline inicial)  
-6) **End (o que você pediu)**:  
+6) **End (retrógrado ancorado no repouso final real)**:  
    - acha `rest0_start`: início do repouso final persistente (`states_end==0`)  
    - varre **retrógrado** a partir de `rest0_start-1` e **para no 1º run** (mais próximo do repouso final)
      onde `states_end >= Δ` por `R_move`, tolerando até `max_gaps` amostras abaixo do limiar  
@@ -49,14 +49,17 @@ with st.sidebar:
     k_states = st.slider("K (k-means na norma)", min_value=3, max_value=12, value=7, step=1)
 
     st.divider()
-    st.subheader("Baselines adaptativos")
+    st.subheader("Baselines adaptativos (menor variância)")
     win_s = st.number_input("Duração janela baseline (s)", min_value=0.5, max_value=6.0, value=2.0, step=0.5)
+
+    st.markdown("**Início**")
     search_first_s = st.number_input("Buscar baseline inicial nos primeiros (s)", min_value=2.0, max_value=40.0, value=10.0, step=1.0)
     guard_start_s = st.number_input("Guarda início (s)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
 
-    # Ainda mantemos estes parâmetros para recortar a região final (mas baseline final será "colada no fim")
-    search_last_s = st.number_input("Região final (s) p/ baseline final", min_value=2.0, max_value=40.0, value=10.0, step=1.0)
+    st.markdown("**Fim**")
+    search_last_s = st.number_input("Buscar baseline final nos últimos (s)", min_value=2.0, max_value=40.0, value=10.0, step=1.0)
     guard_end_s = st.number_input("Guarda final (s)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
+
     step_s = st.number_input("Passo varredura baseline (s)", min_value=0.01, max_value=0.50, value=0.05, step=0.01)
 
     st.divider()
@@ -70,7 +73,7 @@ with st.sidebar:
     r_step_s = st.number_input("Passo R (s)", min_value=0.01, max_value=0.50, value=0.01, step=0.01)
 
     st.divider()
-    st.subheader("End (retro ancorado no repouso final)")
+    st.subheader("End (retro ancorado no repouso final real)")
     delta_states = st.number_input("Δ estados acima do repouso final", min_value=1, max_value=10, value=2, step=1)
     R_rest_s = st.number_input("Persistência repouso final (s)", min_value=0.02, max_value=2.0, value=0.15, step=0.01)
     R_move_s = st.number_input("Persistência movimento forte (s)", min_value=0.02, max_value=2.0, value=0.10, step=0.01)
@@ -168,12 +171,16 @@ def kmeans_1d(x: np.ndarray, k: int, max_iter: int = 40, tol: float = 1e-6):
     return labels.astype(int), centers
 
 def pick_quiet_window(norm: np.ndarray, fs: float, win_s: float, start_s: float, end_s: float, step_s: float):
+    """
+    Retorna (i0, i1, score) da janela de MENOR variância dentro de [start_s, end_s).
+    """
     n = len(norm)
     Wn = int(round(win_s * fs))
     step = max(1, int(round(step_s * fs)))
 
     i_start = int(round(start_s * fs))
     i_end = int(round(end_s * fs))
+
     i_start = max(0, min(n - 1, i_start))
     i_end = max(0, min(n, i_end))
 
@@ -196,6 +203,7 @@ def pick_quiet_window(norm: np.ndarray, fs: float, win_s: float, start_s: float,
         i0 = max(0, n - Wn)
         i1 = n
         return i0, i1, float(np.var(norm[i0:i1]))
+
     return best_i0, best_i1, best_score
 
 def relabel_baseline_as_zero(labels: np.ndarray, i0: int, i1: int):
@@ -268,7 +276,7 @@ def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R
     return int(min(candidates)), ll, (mu, sd, thr)
 
 # =========================================================
-# END: retro ancorado no repouso final (0-run), com gaps
+# END: retro ancorado no repouso final real (0-run), com gaps
 # =========================================================
 def find_first_run_eq_from_end(states: np.ndarray, run_len: int, value: int):
     """
@@ -445,27 +453,25 @@ for up in uploads:
 
         labels, _ = kmeans_1d(norm, k=k_states)
 
-        # ---------------- Baseline inicial: janela mais quieta no começo ----------------
+        # ---------------- Baseline inicial: MENOR VARIÂNCIA no começo ----------------
         i0_b, i1_b, _ = pick_quiet_window(
             norm, fs=fs, win_s=win_s,
-            start_s=guard_start_s, end_s=search_first_s, step_s=step_s
+            start_s=float(guard_start_s),
+            end_s=float(search_first_s),
+            step_s=float(step_s)
         )
 
-        # ---------------- Baseline final: ANCORADA NO FIM (última janela antes do guard_end) ----------------
+        # ---------------- Baseline final: MENOR VARIÂNCIA na região final ----------------
         total_s = float(t[-1] - t[0])
-
-        # região final útil (exclui guard_end_s)
+        end_region_start_s = max(0.0, total_s - float(search_last_s))
         end_region_end_s = max(0.0, total_s - float(guard_end_s))
 
-        Wn = int(round(float(win_s) * fs))
-        i1_f = int(round(end_region_end_s * fs))          # fim da janela final (antes do guard)
-        i0_f = max(0, i1_f - Wn)                          # começa Wn antes
-        i1_f = min(len(norm), i0_f + Wn)                  # garante consistência
-
-        # fallback: se o guard_end jogou a janela pra fora
-        if i1_f - i0_f < 2:
-            i1_f = len(norm)
-            i0_f = max(0, i1_f - max(2, Wn))
+        i0_f, i1_f, _ = pick_quiet_window(
+            norm, fs=fs, win_s=win_s,
+            start_s=float(end_region_start_s),
+            end_s=float(end_region_end_s),
+            step_s=float(step_s)
+        )
 
         # Dois mapas
         states_start, base_label_start = relabel_baseline_as_zero(labels, i0=i0_b, i1=i1_b)
@@ -473,7 +479,7 @@ for up in uploads:
 
         # Start
         start_i, ll_start, (_, _, thr_s) = detect_start_markov_grid(
-            states_start, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
+            states_start, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=float(k_sigma_start)
         )
 
         # Janela mínima (start+offset) para end e picos
@@ -504,7 +510,7 @@ for up in uploads:
         if min_search_i is not None and end_i is not None:
             g1_i, g2_i = find_two_peaks(
                 norm=norm, i_start=min_search_i, i_end=end_i, fs=fs,
-                prom=peak_prom, min_dist_s=peak_min_dist_s
+                prom=float(peak_prom), min_dist_s=float(peak_min_dist_s)
             )
 
         # Componentes por retorno ao estado 1 (states_start)
@@ -551,7 +557,8 @@ for up in uploads:
 
         cache[name] = dict(
             t=t, norm=norm,
-            i0_b=i0_b, i1_b=i1_b, i0_f=i0_f, i1_f=i1_f,
+            i0_b=i0_b, i1_b=i1_b,
+            i0_f=i0_f, i1_f=i1_f,
             start_i=start_i, end_i=end_i,
             rest0_start=rest0_start,
             min_search_i=min_search_i,
@@ -559,8 +566,6 @@ for up in uploads:
             g1_cs=g1_cs, g1_ce=g1_ce, g2_cs=g2_cs, g2_ce=g2_ce,
             ll_start=ll_start,
             debug_end=debug_end,
-            base_label_start=base_label_start,
-            base_label_end=base_label_end,
         )
 
     except Exception as e:
@@ -574,7 +579,7 @@ st.dataframe(res_df, use_container_width=True)
 st.download_button(
     "⬇️ Baixar CSV",
     data=res_df.to_csv(index=False).encode("utf-8"),
-    file_name="markov_tug_results_end_retro_rest_anchored.csv",
+    file_name="markov_tug_results_minvar_baselines_end_retro_rest.csv",
     mime="text/csv"
 )
 
@@ -606,15 +611,15 @@ with colA:
     fig = plt.figure(figsize=(7, 3))
     plt.plot(t, norm)
 
-    plt.axvspan(t[i0_b], t[i1_b - 1], alpha=0.2, label="baseline inicial")
-    plt.axvspan(t[i0_f], t[i1_f - 1], alpha=0.2, label="baseline final (ancorada no fim)")
+    plt.axvspan(t[i0_b], t[i1_b - 1], alpha=0.2, label="baseline inicial (menor var.)")
+    plt.axvspan(t[i0_f], t[i1_f - 1], alpha=0.2, label="baseline final (menor var.)")
 
     if start_i is not None:
         plt.axvline(t[start_i], label="start")
     if min_search_i is not None:
         plt.axvline(t[min_search_i], linestyle=":", label="start+offset (min_search)")
 
-    # repouso final real (0-run)
+    # repouso final real (0-run) detectado em states_end (pode ou não coincidir com a janela baseline final)
     if rest0_start is not None:
         plt.axvline(t[rest0_start], linestyle="--", label="início repouso final (0-run)")
         plt.axvspan(t[rest0_start], t[-1], alpha=0.10, label="repouso final real (0-run→fim)")
