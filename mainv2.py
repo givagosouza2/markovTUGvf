@@ -11,8 +11,11 @@ from scipy.interpolate import interp1d
 # =========================================================
 # Streamlit UI
 # =========================================================
-st.set_page_config(page_title="TUG Markov + End (retro limitado) + Eventos G1/G2", layout="wide")
-st.title("📱 TUG — Markov + FIM retro (a partir da baseline final, com tolerância a gaps) + eventos G1/G2")
+st.set_page_config(
+    page_title="TUG Markov + End (retro a partir da baseline final) + Eventos G1/G2",
+    layout="wide",
+)
+st.title("📱 TUG — Markov + FIM retro (ancorado na baseline final, com gaps) + eventos G1/G2")
 
 st.markdown(
     """
@@ -24,10 +27,11 @@ st.markdown(
    - `states_start`: baseline inicial vira **0**
    - `states_end`: baseline final vira **0**
 5) **Start** por Markov+LL (queda persistente após baseline inicial)  
-6) **End (retro a partir da baseline final)**:  
-   - acha `rest0_start`: começo do repouso final persistente (`states_end==0`)  
-   - varre **retrógrado** a partir de `rest0_start-1` e **para** ao encontrar o 1º run persistente
-     de movimento forte (`states_end>=Δ`) mais próximo da baseline final, com tolerância a gaps  
+6) **End (o que você pediu)**:  
+   - acha `rest0_start`: início do repouso final persistente (`states_end==0`)  
+   - começa a varrer **retrógrado** em `rest0_start-1` e **para no 1º run** (mais próximo da baseline final)
+     onde `states_end >= Δ` por `R_move`, tolerando até `max_gaps` amostras abaixo do limiar  
+   - a busca respeita `min_search_i` e `lookback_cap`  
 7) G1/G2: picos na norma entre (start+offset) e end; componentes delimitados por retorno ao estado 1.
 """
 )
@@ -64,7 +68,7 @@ with st.sidebar:
     r_step_s = st.number_input("Passo R (s)", min_value=0.01, max_value=0.50, value=0.01, step=0.01)
 
     st.divider()
-    st.subheader("End (retro a partir da baseline final)")
+    st.subheader("End (retro ancorado na baseline final)")
     delta_states = st.number_input("Δ estados acima do repouso final", min_value=1, max_value=10, value=2, step=1)
     R_rest_s = st.number_input("Persistência repouso final (s)", min_value=0.02, max_value=2.0, value=0.15, step=0.01)
     R_move_s = st.number_input("Persistência movimento forte (s)", min_value=0.02, max_value=2.0, value=0.10, step=0.01)
@@ -262,52 +266,62 @@ def detect_start_markov_grid(states: np.ndarray, i0_b: int, i1_b: int, W: int, R
     return int(min(candidates)), ll, (mu, sd, thr)
 
 # =========================================================
-# END: retro a partir da baseline final, com tolerância a gaps
+# END: retro ancorado na baseline final
 # =========================================================
 def find_first_run_eq_from_end(states: np.ndarray, run_len: int, value: int):
+    """
+    Retorna o início (i0) do primeiro run do valor 'value' encontrado varrendo de trás pra frente.
+    Ou seja, detecta um repouso final persistente.
+    """
     n = len(states)
     if n < run_len:
         return None
     for i0 in range(n - run_len, -1, -1):
         if np.all(states[i0:i0 + run_len] == value):
-            return i0
+            return int(i0)
     return None
 
-def find_first_run_ge_backwards(states: np.ndarray, start_from: int, stop_at: int,
-                                run_len: int, thr_state: int, max_gaps: int = 0):
+def find_first_run_ge_backwards(states: np.ndarray,
+                                start_from: int,
+                                stop_at: int,
+                                run_len: int,
+                                thr_state: int,
+                                max_gaps: int = 0):
     """
-    Varre de trás pra frente começando em start_from e indo até stop_at (inclusive),
-    e retorna o índice FINAL (mais recente) do PRIMEIRO run (mais próximo de start_from)
-    onde states >= thr_state por run_len amostras, tolerando até max_gaps amostras
-    abaixo do limiar dentro do run (total, não necessariamente consecutivas).
+    Busca retrógrada *ancorada no fim*:
 
-    Regra: gaps só contam depois que o run começou (hits > 0).
+    Varre i = start_from ... stop_at e retorna o PRIMEIRO índice i (mais próximo de start_from)
+    tal que exista um run TERMINANDO em i com:
+      - janela de tamanho (run_len + max_gaps)
+      - >= run_len amostras com states >= thr_state
+      - <= max_gaps amostras abaixo do limiar
+
+    Retorna i (o índice FINAL do run).
     """
-    start_from = min(int(start_from), len(states) - 1)
+    n = len(states)
+    if n == 0:
+        return None
+
+    start_from = min(int(start_from), n - 1)
     stop_at = max(0, int(stop_at))
-    max_gaps = max(0, int(max_gaps))
     run_len = max(1, int(run_len))
+    max_gaps = max(0, int(max_gaps))
 
+    W = run_len + max_gaps
     if start_from - stop_at + 1 < run_len:
         return None
 
-    hits = 0
-    gaps = 0
-
     for i in range(start_from, stop_at - 1, -1):
-        if states[i] >= thr_state:
-            hits += 1
-        else:
-            if hits > 0:
-                gaps += 1
-                if gaps > max_gaps:
-                    hits = 0
-                    gaps = 0
+        j0 = i - W + 1
+        if j0 < 0:
+            j0 = 0
+        window = states[j0:i + 1]
 
-        if hits >= run_len:
-            end_idx = i + (hits + gaps) - 1
-            end_idx = min(end_idx, start_from)
-            return int(end_idx)
+        hits = int(np.sum(window >= thr_state))
+        gaps = int(window.size - hits)
+
+        if hits >= run_len and gaps <= max_gaps:
+            return int(i)
 
     return None
 
@@ -317,10 +331,10 @@ def detect_end_retro_from_baseline(states_end: np.ndarray, fs: float, delta_stat
                                    max_gaps_samples: int = 0):
     """
     1) acha rest0_start: início do repouso final persistente (run de 0 no final)
-    2) começa a busca do END retrógrado A PARTIR de rest0_start-1
-    3) PARA ao encontrar o 1º run persistente de movimento forte (>= delta_states) mais próximo da baseline final
-       permitindo até max_gaps_samples amostras abaixo do limiar dentro do run
-    4) limites: não busca antes de max(min_search_i, rest0_start-cap)
+    2) começa a busca do END retrógrado em rest0_start-1 (ANCORADO na baseline final)
+    3) PARA no 1º run encontrado (mais próximo da baseline final) com states_end >= delta_states
+       por R_move, tolerando até max_gaps_samples amostras abaixo do limiar
+    4) limites: não busca antes de max(min_search_i, rest0_start - cap)
     """
     R_rest = max(1, int(round(R_rest_s * fs)))
     R_move = max(1, int(round(R_move_s * fs)))
@@ -332,11 +346,13 @@ def detect_end_retro_from_baseline(states_end: np.ndarray, fs: float, delta_stat
 
     cap = max(1, int(round(lookback_cap_s * fs)))
 
-    start_from = rest0_start - 1
+    # ponto de início: imediatamente antes do repouso final
+    start_from = int(rest0_start) - 1
     if start_from < 0:
         return None, int(rest0_start), None, {"reason": "rest0_start at beginning", "rest0_start": int(rest0_start)}
 
-    stop_at = max(int(min_search_i), int(rest0_start - cap))
+    # limite inferior da busca (não passa de min_search_i e nem do cap)
+    stop_at = max(int(min_search_i), int(rest0_start) - cap)
 
     end_idx = find_first_run_ge_backwards(
         states_end,
@@ -344,7 +360,7 @@ def detect_end_retro_from_baseline(states_end: np.ndarray, fs: float, delta_stat
         stop_at=stop_at,
         run_len=R_move,
         thr_state=thr_state,
-        max_gaps=int(max_gaps_samples)
+        max_gaps=int(max_gaps_samples),
     )
 
     if end_idx is None:
@@ -456,12 +472,12 @@ for up in uploads:
             states_start, i0_b=i0_b, i1_b=i1_b, W=W, R_list=R_list, k_sigma=k_sigma_start
         )
 
-        # Janela de movimento p/ end e picos: start+offset
+        # Janela mínima (start+offset) para end e picos
         min_search_i = None
         if start_i is not None:
-            min_search_i = min(len(norm) - 1, start_i + peak_offset_samples)
+            min_search_i = min(len(norm) - 1, int(start_i) + peak_offset_samples)
 
-        # End retro: a partir da baseline final, para no 1º run forte encontrado retrógrado (com gaps)
+        # End (retro ancorado na baseline final)
         end_i = None
         rest0_start = None
         end_candidate = None
@@ -538,6 +554,8 @@ for up in uploads:
             g1_i=g1_i, g2_i=g2_i,
             g1_cs=g1_cs, g1_ce=g1_ce, g2_cs=g2_cs, g2_ce=g2_ce,
             ll_start=ll_start,
+            # p/ debug visual (se quiser)
+            debug_end=debug_end,
         )
 
     except Exception as e:
@@ -608,6 +626,16 @@ with colA:
         plt.axvline(t[g2_i], linestyle="--", label="G2")
         if g2_cs is not None and g2_ce is not None:
             plt.axvspan(t[g2_cs], t[g2_ce], alpha=0.15)
+
+    # Debug visual opcional (mostra limites efetivos da busca do END)
+    if show_debug and isinstance(d.get("debug_end", {}), dict) and d["debug_end"]:
+        de = d["debug_end"]
+        sf = de.get("start_from", None)
+        sa = de.get("stop_at", None)
+        if sf is not None and 0 <= int(sf) < len(t):
+            plt.axvline(t[int(sf)], linestyle=":", label="END start_from (rest0_start-1)")
+        if sa is not None and 0 <= int(sa) < len(t):
+            plt.axvline(t[int(sa)], linestyle=":", label="END stop_at (limite)")
 
     plt.xlabel("Tempo (s)")
     plt.ylabel("Norma do giroscópio")
